@@ -1,0 +1,170 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH != "main" && $CI_PIPELINE_SOURCE != "merge_request_event"
+      when: never
+    - when: always
+
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  DEV_SERVER: "35.180.61.79"
+  PPROD_SERVER: "35.180.61.79"
+  PROD_SERVER: "35.180.61.79"
+  DEV_ENDPOINT: http://ec2-35-180-61-79.eu-west-3.compute.amazonaws.com:3000
+  PPROD_ENDPOINT: http://ec2-35-180-61-79.eu-west-3.compute.amazonaws.com:4000
+  PROD_ENDPOINT: http://ec2-35-180-61-79.eu-west-3.compute.amazonaws.com:5000
+  
+stages:
+  - test
+  - build
+  - deploy_dev
+  - deploy_pprod
+  - deploy_prod 
+
+unit_tests:
+  image: node:17-alpine3.14
+  stage: test
+  cache:
+    key: "$CI_COMMIT_REF_NAME"
+    paths:
+      - app/node_modules
+  tags:
+    - ec2
+    - docker
+    - remote
+  before_script:
+    - cd app
+    - npm install
+  script:
+    - npm test
+  artifacts:
+    when: always
+    paths:
+      - app/junit.xml
+    reports:
+      junit: app/junit.xml
+
+lint_tests:
+  image: node:17-alpine3.14
+  stage: test
+  cache:
+    key: "$CI_COMMIT_REF_NAME"
+    paths:
+      - app/node_modules
+    policy: pull   # only pull cache (readonly). cache is update in the previous job (pull-push policy by default)
+  tags:
+    - ec2
+    - docker
+    - remote
+  before_script:
+    - cd app
+    - npm install  
+  script:
+    - echo "Running lint tests..."   
+
+sast:
+  stage: test
+  
+build_image:
+  stage: build
+  tags:
+    - ec2
+    - shell
+    - remote
+  before_script:
+    - export PACKAGE_JSON_VERSION=$(cat app/package.json | jq -r .version)
+    - export VERSION=$PACKAGE_JSON_VERSION.$CI_PIPELINE_IID 
+    - echo "VERSION=$VERSION" >> build.env
+  script:
+    - docker build -t $IMAGE_NAME:$VERSION .
+  artifacts:
+    reports:
+      dotenv: build.env  
+
+push_image:
+  stage: build
+  needs:
+    - build_image 
+  tags:
+    - ec2
+    - shell
+    - remote
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY  
+  script:
+    - docker push $IMAGE_NAME:$VERSION
+
+.deploy:
+  tags:
+    - ec2
+    - shell
+    - remote
+  variables:
+    SSH_KEY: ""
+    HOST_SERVER: ""
+    DEPLOY_ENV: ""
+    APP_PORT: ""
+    ENDPOINT: "" 
+  before_script:
+    - chmod 400 $SSH_KEY
+  script:
+    - scp -o StrictHostKeyChecking=no -i $SSH_KEY ./docker-compose.yaml ubuntu@$HOST_SERVER:/home/ubuntu
+    - ssh -o StrictHostKeyChecking=no -i $SSH_KEY ubuntu@$HOST_SERVER "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+        export COMPOSE_PROJECT_NAME=$DEPLOY_ENV &&
+        export DC_IMAGE_NAME=$IMAGE_NAME &&
+        export DC_IMAGE_TAG=$VERSION &&
+        export DC_APP_PORT=$APP_PORT &&
+        docker-compose down && 
+        docker-compose up -d"
+  environment:
+    name: $DEPLOY_ENV
+    url: $ENDPOINT
+
+deploy:Dev:
+  extends: .deploy
+  stage: deploy_dev
+  variables:
+    SSH_KEY: $SSH_PRIVATE_KEY
+    HOST_SERVER: $DEV_SERVER
+    DEPLOY_ENV: development
+    APP_PORT: 3000
+    ENDPOINT: $DEV_ENDPOINT 
+
+functionnal_test:
+  stage: deploy_dev
+  needs:
+    - deploy:Dev
+  script:
+    - echo "Running functionnal tests..."
+
+deploy:PProd:
+  extends: .deploy
+  stage: deploy_pprod
+  variables:
+    SSH_KEY: $SSH_PRIVATE_KEY
+    HOST_SERVER: $PPROD_SERVER
+    DEPLOY_ENV: pre-prod
+    APP_PORT: 4000
+    ENDPOINT: $PPROD_ENDPOINT
+
+performance_tests:
+  stage: deploy_pprod
+  needs:
+    - deploy:PProd
+  script:
+    - echo "Running performance tests..."
+
+deploy:Prod:
+  extends: .deploy
+  stage: deploy_prod
+  variables:
+    SSH_KEY: $SSH_PRIVATE_KEY
+    HOST_SERVER: $PROD_SERVER
+    DEPLOY_ENV: production
+    APP_PORT: 5000
+    ENDPOINT: $PROD_ENDPOINT
+  when: manual
+
+include:
+  template: Jobs/SAST.gitlab-ci.yml         
+         
